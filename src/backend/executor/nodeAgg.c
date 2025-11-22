@@ -246,6 +246,7 @@
  *-------------------------------------------------------------------------
  */
 
+#include <immintrin.h>
 #include "postgres.h"
 
 #include "access/htup_details.h"
@@ -276,7 +277,8 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 #include <stdlib.h>
-#include <arm_neon.h>
+
+
 
 /*
  * Control how many partitions are created when spilling HashAgg to
@@ -805,17 +807,84 @@ advance_transition_function(AggState *aggstate,
 	MemoryContextSwitchTo(oldContext);
 }
 
-static void advance_aggregates_simd(AggState *aggstate)
+static void
+advance_aggregates_simd(AggState *aggstate)
 {
-    int32_t *buf = aggstate->simd_batch_buf;
-    int n = aggstate->simd_batch_count;
-    int64 total = 0;
+    int32       *buf;
+    int          n;
+    int64        total;
+    int          j;
+    AggStatePerAgg   peragg;
+    AggStatePerGroup pergroup;
 
-    for (int i = 0; i < n; i++)
-        total += buf[i];
+    buf = aggstate->simd_batch_buf;
+    n = aggstate->simd_batch_count;
+    total = 0;
 
-    AggStatePerAgg peragg = &aggstate->peragg[0];
-    AggStatePerGroup pergroup = &aggstate->pergroups[0][peragg->transno];
+#ifdef __AVX2__
+    {
+        __m256i acc;
+
+        acc = _mm256_setzero_si256();
+
+        /* Process 8 x int32 per iteration (32 bytes) */
+        for (j = 0; j + 8 <= n; j += 8)
+        {
+            __m128i v128a;
+            __m128i v128b;
+            __m256i v256a;
+            __m256i v256b;
+
+            /* load 4 ints at a time */
+            v128a = _mm_loadu_si128((__m128i *)&buf[j]);
+            v128b = _mm_loadu_si128((__m128i *)&buf[j + 4]);
+
+            /* widen int32 -> int64: 4 lanes each */
+            v256a = _mm256_cvtepi32_epi64(v128a);
+            v256b = _mm256_cvtepi32_epi64(v128b);
+
+            /* accumulate */
+            acc = _mm256_add_epi64(acc, v256a);
+            acc = _mm256_add_epi64(acc, v256b);
+        }
+
+        /* horizontal sum of acc (4 x int64 lanes) */
+        {
+            __m128i low128;
+            __m128i high128;
+            __m128i sum128;
+            int64   lo;
+            int64   hi;
+
+            low128  = _mm256_castsi256_si128(acc);
+            high128 = _mm256_extracti128_si256(acc, 1);
+            sum128  = _mm_add_epi64(low128, high128);
+
+            lo = _mm_cvtsi128_si64(sum128);
+            hi = _mm_extract_epi64(sum128, 1);
+            total += lo + hi;
+        }
+
+        /* scalar tail */
+        for (; j < n; j++)
+        {
+            total += buf[j];
+        }
+    }
+#else
+    {
+        int i;
+
+        for (i = 0; i < n; i++)
+        {
+            total += buf[i];
+        }
+    }
+#endif
+
+    /* Update aggregate state (assuming single aggregate at index 0) */
+    peragg = &aggstate->peragg[0];
+    pergroup = &aggstate->pergroups[0][peragg->transno];
 
     if (pergroup->transValueIsNull || pergroup->noTransValue)
     {
@@ -825,12 +894,16 @@ static void advance_aggregates_simd(AggState *aggstate)
     }
     else
     {
-        int64 oldv = DatumGetInt64(pergroup->transValue);
+        int64 oldv;
+
+        oldv = DatumGetInt64(pergroup->transValue);
         pergroup->transValue = Int64GetDatum(oldv + total);
     }
 
-    aggstate->simd_batch_count = 0;
+    // elog(NOTICE, "pergroup->transValue: %ld",
+    //      pergroup->transValue);
 
+    aggstate->simd_batch_count = 0;
 }
 
 /*
@@ -2304,10 +2377,16 @@ ExecAgg(PlanState *pstate)
 
 	return NULL;
 }
-void simd_buffer_add(AggState *aggstate, TupleTableSlot *slot)
+static void simd_buffer_add(AggState *aggstate, TupleTableSlot *slot)
 {
+	AggStatePerAgg peragg = &aggstate->peragg[0];
+	Aggref *aggref = peragg->aggref;
+	TargetEntry *tle = (TargetEntry *) linitial(aggref->args);
+	Var *v = (Var *) tle->expr;
+
+	int attno = v->varattno;
     bool isnull;
-    Datum val = slot_getattr(slot, 1, &isnull);
+    Datum val = slot_getattr(slot, attno, &isnull);
 
     if (!isnull)
     {
@@ -2577,15 +2656,16 @@ agg_retrieve_direct(AggState *aggstate)
 					{
 						lookup_hash_entries(aggstate);
 					}
-
+					TupleTableSlot *currslot = tmpcontext->ecxt_outertuple;
 					// TODO, Apply SIMD Here
 					/* Advance the aggregates (or combine functions) */
 					if (aggstate->use_simd_agg)
 					{
-						simd_buffer_add(aggstate, outerslot);
+						simd_buffer_add(aggstate, currslot);
 
-						if (aggstate->simd_batch_count == aggstate->simd_batch_size)
+						if (aggstate->simd_batch_count == aggstate->simd_batch_size){
 							advance_aggregates_simd(aggstate);
+						}
 					}
 					else
 					{
@@ -3402,6 +3482,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	{
 		aggstate->use_simd_agg = false;
 	}
+	elog(NOTICE, "aggstate->use_simd_agg: %d", aggstate->use_simd_agg);
 
 	/*
 	 * phases[0] always exists, but is dummy in sorted/plain mode
