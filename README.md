@@ -48,12 +48,17 @@ Run Script
 Build
 =====================================
 
+    make distclean 
+
     ./configure \
     CFLAGS="-O2 -g -mavx2" \
     --without-icu \
     --prefix="$HOME/pginstall" \
     --enable-debug \
     --enable-cassert
+
+    make -j$(nproc)
+    make install
 
 Start PostgreSQL server
 =====================================
@@ -62,7 +67,16 @@ Start PostgreSQL server
 
     pg_ctl -D "$HOME/pgdata" -l "$HOME/pgdata/logfile" start
 
+    psql -d postgres
+
+    export PG_FORCE_SIMD_AGG=1
+
 
 SQL
 =====================================
+    SET max_parallel_workers_per_gather = 0;
+    SELECT review_rating FROM customer_reviews;
+
+    SELECT sum(review_rating) FROM customer_reviews;
+
     SELECT sum(product_sales_rank ) FROM customer_reviews;
