@@ -1,10 +1,13 @@
 #!/bin/bash
 
 DB=postgres
-CHUNKS=5          # 5 chunks × 10k = 50k rows
-ROWS_PER_CHUNK=5000
+CHUNKS=5          #
+ROWS_PER_CHUNK=1000000
 OUTPUT_DIR=/home/vboxuser/SIMD-postgres/reviews_data
 
+if [ -n "$OUTPUT_DIR" ] && [ "$OUTPUT_DIR" != "/" ]; then
+    rm -rf "$OUTPUT_DIR"
+fi
 mkdir -p $OUTPUT_DIR
 
 echo "Generating $((CHUNKS * ROWS_PER_CHUNK)) rows..."
@@ -18,7 +21,7 @@ for ((i=1;i<=CHUNKS;i++)); do
             SELECT
                 md5(random()::text),
                 (date '2000-01-01' + (random()*7000)::int),
-                (random()*5)::int,
+                1::int,
                 (random()*1000)::int,
                 (random()*1000)::int,
                 lpad((floor(random()*10000000000))::bigint::text, 10, '0'),
@@ -34,7 +37,7 @@ for ((i=1;i<=CHUNKS;i++)); do
 done
 
 # Combine all CSV into one stream → COPY once (best performance)
-echo "Loading into cstore_fdw table using single COPY..."
+echo "Loading into  table using single COPY..."
 cat $OUTPUT_DIR/*.csv | psql -d $DB -c \
 "COPY customer_reviews FROM STDIN CSV"
 

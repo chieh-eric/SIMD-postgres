@@ -246,6 +246,7 @@
  *-------------------------------------------------------------------------
  */
 
+#include <immintrin.h>
 #include "postgres.h"
 
 #include "access/htup_details.h"
@@ -276,7 +277,8 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 #include <stdlib.h>
-#include <arm_neon.h>
+
+bool enable_simd_agg = false;
 
 /*
  * Control how many partitions are created when spilling HashAgg to
@@ -805,32 +807,200 @@ advance_transition_function(AggState *aggstate,
 	MemoryContextSwitchTo(oldContext);
 }
 
-static void advance_aggregates_simd(AggState *aggstate)
+#define INT8SUM_OID 2107
+#define INT4SUM_OID 2108
+
+#define INT4MAX_OID 2116
+
+static void
+advance_aggregates_simd(AggState *aggstate)
 {
-    int32_t *buf = aggstate->simd_batch_buf;
-    int n = aggstate->simd_batch_count;
-    int64 total = 0;
+    int32       *buf;
+    int          n;
+    int64        total;
+	int32 cur_min, cur_max;
+    int          i, j;
+    AggStatePerAgg   peragg;
+    AggStatePerGroup pergroup;
+	Oid fnoid;
+	int32         tmpmin[8];
+    int32         tmpmax[8];
 
-    for (int i = 0; i < n; i++)
-        total += buf[i];
+    buf = aggstate->simd_batch_buf;
+    n = aggstate->simd_batch_count;
+    total = 0;
 
-    AggStatePerAgg peragg = &aggstate->peragg[0];
-    AggStatePerGroup pergroup = &aggstate->pergroups[0][peragg->transno];
+    peragg = &aggstate->peragg[0];
+	fnoid = peragg->aggref->aggfnoid; 
 
-    if (pergroup->transValueIsNull || pergroup->noTransValue)
+	// elog(NOTICE, "fnoid: %d", fnoid);
+
+#ifdef __AVX2__
     {
-        pergroup->transValue = Int64GetDatum(total);
-        pergroup->transValueIsNull = false;
-        pergroup->noTransValue = false;
-    }
-    else
+		if(fnoid == INT4SUM_OID){
+			__m256i acc;
+
+			acc = _mm256_setzero_si256();
+
+			/* Process 8 x int32 per iteration (32 bytes) */
+			for (j = 0; j + 8 <= n; j += 8)
+			{
+				__m128i v128a;
+				__m128i v128b;
+				__m256i v256a;
+				__m256i v256b;
+
+				/* load 4 ints at a time */
+				v128a = _mm_loadu_si128((__m128i *)&buf[j]);
+				v128b = _mm_loadu_si128((__m128i *)&buf[j + 4]);
+
+				/* widen int32 -> int64: 4 lanes each */
+				v256a = _mm256_cvtepi32_epi64(v128a);
+				v256b = _mm256_cvtepi32_epi64(v128b);
+
+				/* accumulate */
+				acc = _mm256_add_epi64(acc, v256a);
+				acc = _mm256_add_epi64(acc, v256b);
+			}
+
+			/* horizontal sum of acc (4 x int64 lanes) */
+			{
+				__m128i low128;
+				__m128i high128;
+				__m128i sum128;
+				int64   lo;
+				int64   hi;
+
+				low128  = _mm256_castsi256_si128(acc);
+				high128 = _mm256_extracti128_si256(acc, 1);
+				sum128  = _mm_add_epi64(low128, high128);
+
+				lo = _mm_cvtsi128_si64(sum128);
+				hi = _mm_extract_epi64(sum128, 1);
+				total += lo + hi;
+			}
+
+			/* scalar tail */
+			for (; j < n; j++)
+			{
+				total += buf[j];
+			}
+		} 
+		else if(fnoid == INT4MAX_OID){
+			if (n >= 8)
+			{
+				__m256i vmin;
+				__m256i vmax;
+				__m256i v;
+				int     idx;
+
+				vmin = _mm256_loadu_si256((__m256i *)&buf[0]);
+				vmax = vmin;
+				idx = 8;
+
+				for (; idx + 8 <= n; idx += 8)
+				{
+					v = _mm256_loadu_si256((__m256i *)&buf[idx]);
+					vmin = _mm256_min_epi32(vmin, v);
+					vmax = _mm256_max_epi32(vmax, v);
+				}
+
+				/* horizontal reduce vmin / vmax to scalars */
+				_mm256_storeu_si256((__m256i *)tmpmin, vmin);
+				_mm256_storeu_si256((__m256i *)tmpmax, vmax);
+
+				cur_min = tmpmin[0];
+				cur_max = tmpmax[0];
+
+				for (j = 1; j < 8; j++)
+				{
+					if (tmpmin[j] < cur_min)
+						cur_min = tmpmin[j];
+					if (tmpmax[j] > cur_max)
+						cur_max = tmpmax[j];
+				}
+
+				/* tail (n not multiple of 8) */
+				for (; idx < n; idx++)
+				{
+					if (buf[idx] < cur_min)
+						cur_min = buf[idx];
+					if (buf[idx] > cur_max)
+						cur_max = buf[idx];
+				}
+			}
+			else
+			{
+				/* small batch: scalar min/max */
+				cur_min = cur_max = buf[0];
+				for (i = 1; i < n; i++)
+				{
+					if (buf[i] < cur_min)
+						cur_min = buf[i];
+					if (buf[i] > cur_max)
+						cur_max = buf[i];
+				}
+			}
+		}
+	}
+#else
     {
-        int64 oldv = DatumGetInt64(pergroup->transValue);
-        pergroup->transValue = Int64GetDatum(oldv + total);
+		if(fnoid == INT4SUM_OID){
+			for (i = 0; i < n; i++)
+			{
+				total += buf[i];
+			}
+		} else if(fnoid == INT4MAX_OID){
+			cur_min = cur_max = buf[0];
+			for (i = 1; i < n; i++)
+			{
+				if (buf[i] < cur_min)
+					cur_min = buf[i];
+				if (buf[i] > cur_max)
+					cur_max = buf[i];
+			}
+		}
     }
+#endif
+
+    /* Update aggregate state (assuming single aggregate at index 0) */
+    pergroup = &aggstate->pergroups[0][peragg->transno];
+
+	if (fnoid == INT4SUM_OID){
+		if (pergroup->transValueIsNull || pergroup->noTransValue)
+		{
+			pergroup->transValue = Int64GetDatum(total);
+			pergroup->transValueIsNull = false;
+			pergroup->noTransValue = false;
+		}
+		else
+		{
+			int64 oldv;
+
+			oldv = DatumGetInt64(pergroup->transValue);
+			pergroup->transValue = Int64GetDatum(oldv + total);
+		}
+
+		// elog(NOTICE, "pergroup->transValue: %ld",
+		//      pergroup->transValue);
+	}
+	else if (fnoid == INT4MAX_OID)
+    {
+        if (pergroup->transValueIsNull)
+        {
+            pergroup->transValue       = Int32GetDatum(cur_max);
+            pergroup->transValueIsNull = false;
+        }
+        else
+        {
+            int32 old = DatumGetInt32(pergroup->transValue);
+            if (cur_max > old)
+                pergroup->transValue = Int32GetDatum(cur_max);
+        }
+    }
+    
 
     aggstate->simd_batch_count = 0;
-
 }
 
 /*
@@ -2304,10 +2474,16 @@ ExecAgg(PlanState *pstate)
 
 	return NULL;
 }
-void simd_buffer_add(AggState *aggstate, TupleTableSlot *slot)
+static void simd_buffer_add(AggState *aggstate, TupleTableSlot *slot)
 {
+	AggStatePerAgg peragg = &aggstate->peragg[0];
+	Aggref *aggref = peragg->aggref;
+	TargetEntry *tle = (TargetEntry *) linitial(aggref->args);
+	Var *v = (Var *) tle->expr;
+
+	int attno = v->varattno;
     bool isnull;
-    Datum val = slot_getattr(slot, 1, &isnull);
+    Datum val = slot_getattr(slot, attno, &isnull);
 
     if (!isnull)
     {
@@ -2577,15 +2753,16 @@ agg_retrieve_direct(AggState *aggstate)
 					{
 						lookup_hash_entries(aggstate);
 					}
-
+					TupleTableSlot *currslot = tmpcontext->ecxt_outertuple;
 					// TODO, Apply SIMD Here
 					/* Advance the aggregates (or combine functions) */
 					if (aggstate->use_simd_agg)
 					{
-						simd_buffer_add(aggstate, outerslot);
+						simd_buffer_add(aggstate, currslot);
 
-						if (aggstate->simd_batch_count == aggstate->simd_batch_size)
+						if (aggstate->simd_batch_count == aggstate->simd_batch_size){
 							advance_aggregates_simd(aggstate);
+						}
 					}
 					else
 					{
@@ -3402,6 +3579,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	{
 		aggstate->use_simd_agg = false;
 	}
+	elog(NOTICE, "aggstate->use_simd_agg: %d", aggstate->use_simd_agg);
 
 	/*
 	 * phases[0] always exists, but is dummy in sorted/plain mode
