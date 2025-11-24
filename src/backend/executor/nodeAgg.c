@@ -812,6 +812,8 @@ advance_transition_function(AggState *aggstate,
 
 #define INT4MAX_OID 2116
 
+#define INT4MIN_OID 2132
+
 static void
 advance_aggregates_simd(AggState *aggstate)
 {
@@ -886,7 +888,7 @@ advance_aggregates_simd(AggState *aggstate)
 				total += buf[j];
 			}
 		} 
-		else if(fnoid == INT4MAX_OID){
+		else if(fnoid == INT4MAX_OID || fnoid == INT4MIN_OID){
 			if (n >= 8)
 			{
 				__m256i vmin;
@@ -950,7 +952,7 @@ advance_aggregates_simd(AggState *aggstate)
 			{
 				total += buf[i];
 			}
-		} else if(fnoid == INT4MAX_OID){
+		} else if(fnoid == INT4MAX_OID || fnoid == INT4MIN_OID){
 			cur_min = cur_max = buf[0];
 			for (i = 1; i < n; i++)
 			{
@@ -996,6 +998,20 @@ advance_aggregates_simd(AggState *aggstate)
             int32 old = DatumGetInt32(pergroup->transValue);
             if (cur_max > old)
                 pergroup->transValue = Int32GetDatum(cur_max);
+        }
+    }
+	else if (fnoid == INT4MIN_OID)
+    {
+        if (pergroup->transValueIsNull)
+        {
+            pergroup->transValue       = Int32GetDatum(cur_min);
+            pergroup->transValueIsNull = false;
+        }
+        else
+        {
+            int32 old = DatumGetInt32(pergroup->transValue);
+            if (cur_min < old)
+                pergroup->transValue = Int32GetDatum(cur_min);
         }
     }
     
