@@ -79,4 +79,8 @@ SQL
 
     SELECT sum(review_rating) FROM customer_reviews;
 
+    SELECT max(review_rating) FROM customer_reviews;
+
+    SELECT min(review_rating) FROM customer_reviews;
+
     SELECT sum(product_sales_rank ) FROM customer_reviews;

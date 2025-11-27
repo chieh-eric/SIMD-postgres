@@ -276,6 +276,7 @@
 #include "utils/memutils_memorychunk.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
+#include "fmgr.h"
 #include <stdlib.h>
 
 bool enable_simd_agg = false;
@@ -807,12 +808,16 @@ advance_transition_function(AggState *aggstate,
 	MemoryContextSwitchTo(oldContext);
 }
 
+
+
 #define INT8SUM_OID 2107
 #define INT4SUM_OID 2108
 
 #define INT4MAX_OID 2116
 
 #define INT4MIN_OID 2132
+
+#define INT4CNT_OID 2147
 
 static void
 advance_aggregates_simd(AggState *aggstate)
@@ -824,6 +829,8 @@ advance_aggregates_simd(AggState *aggstate)
     int          i, j;
     AggStatePerAgg   peragg;
     AggStatePerGroup pergroup;
+	AggStatePerTrans pertrans;
+
 	Oid fnoid;
 	int32         tmpmin[8];
     int32         tmpmax[8];
@@ -833,6 +840,7 @@ advance_aggregates_simd(AggState *aggstate)
     total = 0;
 
     peragg = &aggstate->peragg[0];
+	pertrans = &aggstate->pertrans[peragg->transno];
 	fnoid = peragg->aggref->aggfnoid; 
 
 	// elog(NOTICE, "fnoid: %d", fnoid);
@@ -969,22 +977,50 @@ advance_aggregates_simd(AggState *aggstate)
     pergroup = &aggstate->pergroups[0][peragg->transno];
 
 	if (fnoid == INT4SUM_OID){
+		FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+		Datum newTrans;
+
+		/* If this is the first batch and there's no state yet, seed from initValue */
+		if (pergroup->transValueIsNull && pertrans->initValueIsNull == false)
+		{
+			pergroup->transValue       = pertrans->initValue;
+			pergroup->transValueIsNull = false;
+			pergroup->noTransValue     = false;
+		}
+
+		
+
+		fcinfo->args[0].value = pergroup->transValue;
+		fcinfo->args[0].isnull = pergroup->transValueIsNull;
+		fcinfo->isnull = false;	
+
+		/* total is int64 sum of this batch */
+		fcinfo->args[1].value = Int64GetDatum(total);
+		fcinfo->args[1].isnull = false;
+
+		newTrans = FunctionCallInvoke(fcinfo);
+
+		pergroup->transValue       = newTrans;
+		pergroup->transValueIsNull = fcinfo->isnull;
+		pergroup->noTransValue     = false;
+	}
+	else if (fnoid == INT4CNT_OID)
+    {
 		if (pergroup->transValueIsNull || pergroup->noTransValue)
 		{
-			pergroup->transValue = Int64GetDatum(total);
+			pergroup->transValue = Int32GetDatum(n);
 			pergroup->transValueIsNull = false;
 			pergroup->noTransValue = false;
 		}
 		else
 		{
-			int64 oldv;
+			int32 oldv;
 
-			oldv = DatumGetInt64(pergroup->transValue);
-			pergroup->transValue = Int64GetDatum(oldv + total);
+			oldv = DatumGetInt32(pergroup->transValue);
+			pergroup->transValue = Int32GetDatum(oldv + n);
 		}
-
-		// elog(NOTICE, "pergroup->transValue: %ld",
-		//      pergroup->transValue);
+		elog(NOTICE, "pergroup->transValue: %ld",
+		     pergroup->transValue);
 	}
 	else if (fnoid == INT4MAX_OID)
     {
@@ -1014,8 +1050,6 @@ advance_aggregates_simd(AggState *aggstate)
                 pergroup->transValue = Int32GetDatum(cur_min);
         }
     }
-    
-
     aggstate->simd_batch_count = 0;
 }
 
