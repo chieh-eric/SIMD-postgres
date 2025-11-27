@@ -977,51 +977,34 @@ advance_aggregates_simd(AggState *aggstate)
     pergroup = &aggstate->pergroups[0][peragg->transno];
 
 	if (fnoid == INT4SUM_OID){
-		FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
-		Datum newTrans;
-
-		/* If this is the first batch and there's no state yet, seed from initValue */
-		if (pergroup->transValueIsNull && pertrans->initValueIsNull == false)
-		{
-			pergroup->transValue       = pertrans->initValue;
-			pergroup->transValueIsNull = false;
-			pergroup->noTransValue     = false;
-		}
-
-		
-
-		fcinfo->args[0].value = pergroup->transValue;
-		fcinfo->args[0].isnull = pergroup->transValueIsNull;
-		fcinfo->isnull = false;	
-
-		/* total is int64 sum of this batch */
-		fcinfo->args[1].value = Int64GetDatum(total);
-		fcinfo->args[1].isnull = false;
-
-		newTrans = FunctionCallInvoke(fcinfo);
-
-		pergroup->transValue       = newTrans;
-		pergroup->transValueIsNull = fcinfo->isnull;
-		pergroup->noTransValue     = false;
-	}
-	else if (fnoid == INT4CNT_OID)
-    {
 		if (pergroup->transValueIsNull || pergroup->noTransValue)
 		{
-			pergroup->transValue = Int32GetDatum(n);
+			pergroup->transValue = Int64GetDatum(total);
 			pergroup->transValueIsNull = false;
 			pergroup->noTransValue = false;
 		}
 		else
 		{
-			int32 oldv;
+			int64 oldv;
 
-			oldv = DatumGetInt32(pergroup->transValue);
-			pergroup->transValue = Int32GetDatum(oldv + n);
+			oldv = DatumGetInt64(pergroup->transValue);
+			pergroup->transValue = Int64GetDatum(oldv + total);
 		}
-		elog(NOTICE, "pergroup->transValue: %ld",
-		     pergroup->transValue);
 	}
+	else if (fnoid == INT4CNT_OID)
+    {
+        if (pergroup->transValueIsNull || pergroup->noTransValue)
+        {
+            pergroup->transValue       = Int32GetDatum(n);
+            pergroup->transValueIsNull = false;
+            pergroup->noTransValue     = false;
+        }
+        else
+        {
+            int32 oldv = DatumGetInt32(pergroup->transValue);
+            pergroup->transValue = Int32GetDatum(oldv + n);
+        }
+    }
 	else if (fnoid == INT4MAX_OID)
     {
         if (pergroup->transValueIsNull)
@@ -1052,6 +1035,7 @@ advance_aggregates_simd(AggState *aggstate)
     }
     aggstate->simd_batch_count = 0;
 }
+
 
 /*
  * Advance each aggregate transition state for one input tuple.  The input
@@ -3617,13 +3601,14 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	/* Decide if we should enable SIMD */
 	/* Environment flag override */
 	const char *flag = getenv("PG_FORCE_SIMD_AGG");
-	if (flag != NULL && strcmp(flag, "1") == 0)
+	if (flag != NULL &&
+		strcmp(flag, "1") == 0 &&
+		node->aggsplit == AGGSPLIT_INITIAL_SERIAL)  // Disable SIMD for the final combine phase
 	{
 		aggstate->use_simd_agg = true;
-		/* SIMD init, temporary */
-		aggstate->simd_batch_size  = 4096;   
+		aggstate->simd_batch_size  = 4096;
 		aggstate->simd_batch_count = 0;
-		aggstate->simd_batch_buf = palloc(sizeof(int32) * aggstate->simd_batch_size);
+		aggstate->simd_batch_buf   = palloc(sizeof(int32) * aggstate->simd_batch_size);
 	}
 	else
 	{
