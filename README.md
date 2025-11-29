@@ -39,6 +39,26 @@ Generate Data
         similar_product_ids CHAR(10)[]
     )
 
+    CREATE TABLE lineitem (
+        l_orderkey      integer NOT NULL,
+        l_partkey       integer NOT NULL,
+        l_suppkey       integer NOT NULL,
+        l_linenumber    integer NOT NULL,
+        l_quantity      numeric(15,2) NOT NULL,
+        l_extendedprice numeric(15,2) NOT NULL,
+        l_discount      numeric(15,2) NOT NULL,
+        l_tax           numeric(15,2) NOT NULL,
+        l_returnflag    character(1) NOT NULL,
+        l_linestatus    character(1) NOT NULL,
+        l_shipdate      date NOT NULL,
+        l_commitdate    date NOT NULL,
+        l_receiptdate   date NOT NULL,
+        l_shipinstruct  character(25) NOT NULL,
+        l_shipmode      character(10) NOT NULL,
+        l_comment       character varying(44) NOT NULL
+    );
+
+
 Run Script
 
     chmod +x generate_and_load.sh
@@ -75,6 +95,9 @@ Start PostgreSQL server
 SQL
 =====================================
     SET max_parallel_workers_per_gather = 0;
+
+    SELECT sum(l_orderkey) from lineitem;
+
     SELECT review_rating FROM customer_reviews;
 
     SELECT sum(review_rating) FROM customer_reviews;
