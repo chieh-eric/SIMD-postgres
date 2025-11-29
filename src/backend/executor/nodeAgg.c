@@ -246,9 +246,11 @@
  *-------------------------------------------------------------------------
  */
 
+#ifdef __AVX2__
 #include <immintrin.h>
-#include "postgres.h"
+#endif
 
+#include "postgres.h"
 #include "access/htup_details.h"
 #include "access/parallel.h"
 #include "catalog/objectaccess.h"
@@ -277,7 +279,9 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 #include <stdlib.h>
+#ifdef __aarch64__
 #include <arm_neon.h>
+#endif
 #include "utils/array.h"
 
 
@@ -817,12 +821,12 @@ advance_transition_function(AggState *aggstate,
 	MemoryContextSwitchTo(oldContext);
 }
 
-#define INT8SUM_OID 2107
-#define INT4SUM_OID 2108
+typedef struct Int8TransTypeData
+{
+    int64   count;
+    int64   sum;
+} Int8TransTypeData;
 
-#define INT4MAX_OID 2116
-
-#define INT4MIN_OID 2132
 
 static void
 advance_aggregates_simd(AggState *aggstate)
@@ -846,10 +850,91 @@ advance_aggregates_simd(AggState *aggstate)
 	fnoid = peragg->aggref->aggfnoid; 
 
 	// elog(NOTICE, "fnoid: %d", fnoid);
+#ifdef __aarch64__
+	{
 
-#ifdef __AVX2__
+		i = 0;
+		AggStatePerAgg   peragg = &aggstate->peragg[0];
+		AggStatePerGroup pergroup;
+		Aggref          *aggref = peragg->aggref;
+		TargetEntry     *tle;
+		Var             *v;
+		int64x2_t        vsum64;
+		int64            lanes[2];
+		if (fnoid == INT4SUM_OID || fnoid == INT8AVG_OID)
+		{
+			tle = (TargetEntry *) linitial(aggref->args);
+			v   = (Var *) tle->expr;
+			vsum64 = vdupq_n_s64(0);
+			for (; i + 4 <= n; i += 4)
+			{
+				int32x4_t v32 = vld1q_s32(&buf[i]);
+				int64x2_t v64 = vpaddlq_s32(v32);
+				vsum64 = vaddq_s64(vsum64, v64);
+			}
+			vst1q_s64(lanes, vsum64);
+			total = lanes[0] + lanes[1];
+			for (; i < n; i++)
+				total += buf[i];
+		}
+		else if(fnoid == INT4MIN_OID || fnoid == INT4MAX_OID){
+			if (n >= 4)
+			{
+				int32x4_t vmin = vld1q_s32(&buf[0]);
+				int32x4_t vmax = vmin;
+
+				int idx = 4;
+
+				for (; idx + 4 <= n; idx += 4)
+				{
+					int32x4_t v = vld1q_s32(&buf[idx]);
+					vmin = vminq_s32(vmin, v);
+					vmax = vmaxq_s32(vmax, v);
+				}
+
+				/* horizontal reduction */
+				int32_t tmpmin[4], tmpmax[4];
+				vst1q_s32(tmpmin, vmin);
+				vst1q_s32(tmpmax, vmax);
+
+				cur_min = tmpmin[0];
+				cur_max = tmpmax[0];
+
+				for (int j = 1; j < 4; j++)
+				{
+					if (tmpmin[j] < cur_min)
+						cur_min = tmpmin[j];
+					if (tmpmax[j] > cur_max)
+						cur_max = tmpmax[j];
+				}
+
+				/* tail elements */
+				for (; idx < n; idx++)
+				{
+					if (buf[idx] < cur_min)
+						cur_min = buf[idx];
+					if (buf[idx] > cur_max)
+						cur_max = buf[idx];
+				}
+			}
+			else
+			{
+				/* small batch: scalar min/max */
+				cur_min = cur_max = buf[0];
+				for (i = 1; i < n; i++)
+				{
+					if (buf[i] < cur_min)
+						cur_min = buf[i];
+					if (buf[i] > cur_max)
+						cur_max = buf[i];
+				}
+			}
+		}
+	}
+
+#elif defined(__AVX2__)
     {
-		if(fnoid == INT4SUM_OID){
+		if(fnoid == INT4SUM_OID || fnoid == fnoid == INT8AVG_OID){
 			__m256i acc;
 
 			acc = _mm256_setzero_si256();
@@ -957,7 +1042,7 @@ advance_aggregates_simd(AggState *aggstate)
 	}
 #else
     {
-		if(fnoid == INT4SUM_OID){
+		if(fnoid == INT4SUM_OID || fnoid == INT8AVG_OID){
 			for (i = 0; i < n; i++)
 			{
 				total += buf[i];
@@ -987,9 +1072,7 @@ advance_aggregates_simd(AggState *aggstate)
 		}
 		else
 		{
-			int64 oldv;
-
-			oldv = DatumGetInt64(pergroup->transValue);
+			int64 oldv = DatumGetInt64(pergroup->transValue);
 			pergroup->transValue = Int64GetDatum(oldv + total);
 		}
 
@@ -1024,8 +1107,18 @@ advance_aggregates_simd(AggState *aggstate)
                 pergroup->transValue = Int32GetDatum(cur_min);
         }
     }
-    
+	else if (fnoid == INT8AVG_OID)
+	{
+		pergroup = &aggstate->pergroups[aggstate->current_set][peragg->transno];
+		ArrayType         *transarray;
+		Int8TransTypeData *transdata;
 
+		transarray = DatumGetArrayTypeP(pergroup->transValue);
+		transdata = (Int8TransTypeData *) ARR_DATA_PTR(transarray);
+		transdata->sum   += total;
+		transdata->count += n;
+		aggstate->simd_batch_count = 0;
+	}
     aggstate->simd_batch_count = 0;
 }
 
@@ -3560,7 +3653,11 @@ static bool agg_supports_simd(AggState *aggstate)
         elog(LOG, "[SIMD] Enabled: AVG (%u) using SIMD-SUM + scalar COUNT", fno);
         return true;
     }
-
+	if (fno == INT4MIN_OID || fno == INT4MAX_OID)
+	{
+		elog(LOG, "[SIMD] Enabled: MIN/MAX (%u)", fno);
+        return true;
+	}
     elog(LOG, "[SIMD] Disabled: Unsupported aggregate fnoid=%u", fno);
     return false;
 }
