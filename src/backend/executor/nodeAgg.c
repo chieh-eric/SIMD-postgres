@@ -277,8 +277,18 @@
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 #include <stdlib.h>
+#include <arm_neon.h>
+#include "utils/array.h"
 
-bool enable_simd_agg = false;
+
+#define INT8SUM_OID 2107
+#define INT4SUM_OID 2108
+#define INT4MAX_OID 2116
+#define INT4MIN_OID 2132
+#define COUNT_ANY_OID 2147
+#define INT4AVG_OID 2100
+#define INT8AVG_OID 2101
+
 
 /*
  * Control how many partitions are created when spilling HashAgg to
@@ -1018,6 +1028,7 @@ advance_aggregates_simd(AggState *aggstate)
 
     aggstate->simd_batch_count = 0;
 }
+
 
 /*
  * Advance each aggregate transition state for one input tuple.  The input
@@ -3513,6 +3524,47 @@ hashagg_reset_spill_state(AggState *aggstate)
 		aggstate->hash_tapeset = NULL;
 	}
 }
+static bool agg_supports_simd(AggState *aggstate)
+{
+    AggStatePerAgg peragg;
+    Aggref *aggref;
+
+    /* Disable SIMD in the final combine phase */
+    if (aggstate->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+    {
+        elog(LOG, "[SIMD] Disabled: parallel final combine stage");
+        return false;
+    }
+
+    peragg = &aggstate->peragg[0];
+    aggref = peragg->aggref;
+    Oid fno = aggref->aggfnoid;
+
+    /* Disable SIMD for COUNT */
+    if (fno == COUNT_ANY_OID)
+    {
+        elog(LOG, "[SIMD] Disabled: COUNT");
+        return false;
+    }
+
+    /* SUM(int4/int8) supported */
+    if (fno == INT4SUM_OID || fno == INT8SUM_OID)
+    {
+        elog(LOG, "[SIMD] Enabled: SUM (%u)", fno);
+        return true;
+    }
+
+    /* AVG(int8) */
+    if (fno == INT8AVG_OID)
+    {
+        elog(LOG, "[SIMD] Enabled: AVG (%u) using SIMD-SUM + scalar COUNT", fno);
+        return true;
+    }
+
+    elog(LOG, "[SIMD] Disabled: Unsupported aggregate fnoid=%u", fno);
+    return false;
+}
+
 
 
 /* -----------------
@@ -3580,22 +3632,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	aggstate->sort_in = NULL;
 	aggstate->sort_out = NULL;
 
-	/* Decide if we should enable SIMD */
-	/* Environment flag override */
-	const char *flag = getenv("PG_FORCE_SIMD_AGG");
-	if (flag != NULL && strcmp(flag, "1") == 0)
-	{
-		aggstate->use_simd_agg = true;
-		/* SIMD init, temporary */
-		aggstate->simd_batch_size  = 4096;   
-		aggstate->simd_batch_count = 0;
-		aggstate->simd_batch_buf = palloc(sizeof(int32) * aggstate->simd_batch_size);
-	}
-	else
-	{
-		aggstate->use_simd_agg = false;
-	}
-	elog(NOTICE, "aggstate->use_simd_agg: %d", aggstate->use_simd_agg);
+	
 
 	/*
 	 * phases[0] always exists, but is dummy in sorted/plain mode
@@ -4382,6 +4419,21 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 		phase->evaltrans_cache[0][0] = phase->evaltrans;
 	}
 
+	/* Decide if we should enable SIMD */
+	/* Environment flag override */
+	const char *flag = getenv("PG_FORCE_SIMD_AGG");
+	if (flag != NULL && strcmp(flag, "1") == 0 && agg_supports_simd(aggstate))  // Disable SIMD for the final combine phase
+	{
+		aggstate->use_simd_agg = true;
+		aggstate->simd_batch_size  = 4096;
+		aggstate->simd_batch_count = 0;
+		aggstate->simd_batch_buf   = palloc(sizeof(int32) * aggstate->simd_batch_size);
+	}
+	else
+	{
+		elog(LOG, "Doesn't activate SIMD");
+		aggstate->use_simd_agg = false;
+	}
 	return aggstate;
 }
 
