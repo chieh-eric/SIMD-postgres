@@ -424,10 +424,6 @@ ExecSeqScanWithQual(PlanState *pstate)
 	pg_assume(pstate->qual != NULL);
 	Assert(pstate->ps_ProjInfo == NULL);
 
-	elog(NOTICE, "ExecSeqScanWithQual");
-	if(node->use_simd_filter)
-		return ExecSeqScanSIMD(node);
-
 	return ExecScanExtended(&node->ss,
 							(ExecScanAccessMtd) SeqNext,
 							(ExecScanRecheckMtd) SeqRecheck,
@@ -580,8 +576,9 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 
 		/* We only handle one simple qual: WHERE col OP const/param */
 		if (list_length(qualList) != 1){
-			elog(LOG, "Doesn't activate SIMD Filter");
+			elog(NOTICE, "[SIMD] Disabled: Filter");
 			scanstate->use_simd_filter = false;
+			return scanstate;
 		}
 
 		Expr *expr = linitial(qualList);
@@ -596,7 +593,7 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 		if (analyze_simd_filter_qual(expr,
 									&attno, &opk, &is_param, &param_id, &const_val))
 		{
-			elog(NOTICE, "activate SIMD Filter");
+			elog(NOTICE, "[SIMD] Enabled: Filter");
 			scanstate->use_simd_filter   = true;
 			scanstate->filter_op         = opk;
 			scanstate->filter_attno      = attno;
@@ -614,13 +611,13 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 		}
 		else
 		{
-			elog(NOTICE, "Doesn't activate SIMD Filter");
+			elog(NOTICE, "[SIMD] Disabled: Filter");
 			scanstate->use_simd_filter = false;
 		}
 	}
 	else
 	{
-		elog(NOTICE, "Doesn't activate SIMD Filter");
+		elog(NOTICE, "[SIMD] Disabled: Filter");
 		scanstate->use_simd_filter = false;
 	}
 	return scanstate;
