@@ -33,6 +33,291 @@
 #include "executor/executor.h"
 #include "executor/nodeSeqscan.h"
 #include "utils/rel.h"
+#include <immintrin.h>
+
+#define INT4GTOID 521
+#define INT4EQOID 96
+#define INT4LTOID 97
+
+
+static bool
+analyze_simd_filter_qual(Expr *qual,
+                         AttrNumber *attno,
+                         SimdFilterOp *opkind,
+                         bool *is_param,
+                         int *param_id,
+                         int32 *const_val)
+{
+    if (qual == NULL)
+        return false;
+    if (!IsA(qual, OpExpr))
+        return false;
+
+    OpExpr *op = (OpExpr *) qual;
+    /* expect exactly 2 args: Var op Const/Param */
+    if (list_length(op->args) != 2)
+        return false;
+
+    Expr *left  = linitial(op->args);
+    Expr *right = lsecond(op->args);
+
+    /* left must be Var(l_orderkey) */
+    if (!IsA(left, Var))
+        return false;
+
+    Var *var = (Var *) left;
+    if (var->varattno <= 0)
+        return false;
+    if (var->vartype != INT4OID)
+        return false;
+
+    /* map operator OID -> SimdFilterOp */
+    SimdFilterOp opk;
+    if (op->opno == INT4GTOID)
+        opk = SIMD_FILTER_GT;
+    else if (op->opno == INT4EQOID)
+        opk = SIMD_FILTER_EQ;
+    else if (op->opno == INT4LTOID)
+        opk = SIMD_FILTER_LT;
+    else
+        return false;      /* unsupported operator */
+
+    /* right is Const OR Param(int4) */
+    if (IsA(right, Const))
+    {
+        Const *c = (Const *) right;
+
+        if (c->constisnull || c->consttype != INT4OID)
+            return false;
+
+        *attno     = var->varattno;
+        *opkind    = opk;
+        *is_param  = false;
+        *const_val = DatumGetInt32(c->constvalue);
+        return true;
+    }
+    else if (IsA(right, Param))
+    {
+        Param *p = (Param *) right;
+
+        if (p->paramtype != INT4OID)
+            return false;
+
+        *attno       = var->varattno;
+        *opkind      = opk;
+        *is_param    = true;
+        *param_id    = p->paramid;
+        *const_val   = 0;       /* filled at runtime */
+        return true;
+    }
+
+    return false;
+}
+
+static void
+update_simd_threshold_from_param(SeqScanState *node)
+{
+    if (!node->filter_from_param)
+        return;
+
+    EState         *estate = node->ss.ps.state;
+    ParamExecData  *prm;
+
+    /* For simple Param execution, you can use es_param_list_info or es_param_exec_vals
+       depending on how your query is executed. For simplicity, assume exec params: */
+    prm = &(estate->es_param_exec_vals[node->filter_param_id]);
+
+    Assert(!prm->isnull);
+    node->filter_threshold = DatumGetInt32(prm->value);
+}
+
+static int
+simd_filter_int32(int32 *values, int n, int32 threshold,
+                  SimdFilterOp op, int *match_idx)
+{
+    int match_count = 0;
+	Assert(n >= 0);
+    Assert(n <= 4096);
+
+#ifdef __AVX2__
+    __m256i thr = _mm256_set1_epi32(threshold);
+    int i = 0;
+
+    for (; i + 8 <= n; i += 8)
+    {
+        __m256i v = _mm256_loadu_si256((const __m256i *)&values[i]);
+        __m256i cmp;
+
+        switch (op)
+        {
+            case SIMD_FILTER_GT:
+                cmp = _mm256_cmpgt_epi32(v, thr);             /* v > thr */
+                break;
+            case SIMD_FILTER_LT:
+                /* v < thr  == thr > v */
+                cmp = _mm256_cmpgt_epi32(thr, v);
+                break;
+            case SIMD_FILTER_EQ:
+                cmp = _mm256_cmpeq_epi32(v, thr);             /* v == thr */
+                break;
+            default:
+                /* shouldn't happen */
+                cmp = _mm256_setzero_si256();
+                break;
+        }
+
+        int mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
+
+        while (mask)
+        {
+            int bit = __builtin_ctz(mask);
+            match_idx[match_count++] = i + bit;
+            mask &= (mask - 1);
+        }
+    }
+
+    /* scalar tail */
+    for (; i < n; i++)
+    {
+        bool pass = false;
+
+        switch (op)
+        {
+            case SIMD_FILTER_GT: pass = (values[i] > threshold); break;
+            case SIMD_FILTER_LT: pass = (values[i] < threshold); break;
+            case SIMD_FILTER_EQ: pass = (values[i] == threshold); break;
+            default:             pass = false; break;
+        }
+
+        if (pass)
+            match_idx[match_count++] = i;
+    }
+#else
+    /* pure scalar fallback */
+    for (int i = 0; i < n; i++)
+    {
+        bool pass = false;
+
+        switch (op)
+        {
+            case SIMD_FILTER_GT: pass = (values[i] > threshold); break;
+            case SIMD_FILTER_LT: pass = (values[i] < threshold); break;
+            case SIMD_FILTER_EQ: pass = (values[i] == threshold); break;
+            default:             pass = false; break;
+        }
+
+        if (pass)
+            match_idx[match_count++] = i;
+    }
+#endif
+
+    return match_count;
+}
+
+
+/*
+ * ExecSeqScanSIMD_Simple
+ *
+ * Specialized SIMD scan for queries like:
+ *   SELECT l_orderkey FROM lineitem WHERE l_orderkey < const;
+ *
+ * Returns a 1-column slot (int4) using ps_ResultTupleSlot.
+ */
+static TupleTableSlot *
+ExecSeqScanSIMD(SeqScanState *node)
+{
+    EState         *estate   = node->ss.ps.state;
+    TableScanDesc   scandesc = node->ss.ss_currentScanDesc;
+    ScanDirection   direction = estate->es_direction;
+    TupleTableSlot *scanSlot  = node->ss.ss_ScanTupleSlot;
+    TupleTableSlot *resultSlot = node->ss.ps.ps_ResultTupleSlot; /* 1-column */
+
+    /* Initialize scan descriptor (like SeqNext) */
+    if (scandesc == NULL)
+    {
+        scandesc = table_beginscan(node->ss.ss_currentRelation,
+                                   estate->es_snapshot,
+                                   0, NULL);
+        node->ss.ss_currentScanDesc = scandesc;
+    }
+
+    /* Initialize threshold from Param once per scan, if needed */
+    if (node->filter_from_param && !node->simd_threshold_inited)
+    {
+        update_simd_threshold_from_param(node);
+        node->simd_threshold_inited = true;
+    }
+
+    for (;;)
+    {
+        /* 1) Serve pending matches from previous batch */
+        if (node->simd_match_pos < node->simd_match_count)
+        {
+            int idx   = node->simd_match_idx[node->simd_match_pos++];
+            int32 val = node->simd_values[idx];
+
+            /* Build a 1-column virtual tuple: (l_orderkey) */
+            ExecClearTuple(resultSlot);
+            resultSlot->tts_values[0]  = Int32GetDatum(val);
+            resultSlot->tts_isnull[0]  = false;
+            ExecStoreVirtualTuple(resultSlot);
+
+            return resultSlot;
+        }
+
+        /* 2) No pending matches: build a new batch of l_orderkey values */
+        node->simd_batch_count = 0;
+        node->simd_match_count = 0;
+        node->simd_match_pos   = 0;
+
+        while (node->simd_batch_count < node->simd_batch_size)
+        {
+            bool ok = table_scan_getnextslot(scandesc,
+                                             direction,
+                                             scanSlot);
+            if (!ok)
+                break; /* end of relation */
+
+            /* Extract l_orderkey only */
+            bool  isnull;
+            int   attno = node->filter_attno;   /* 1-based */
+            Datum d = slot_getattr(scanSlot, attno, &isnull);
+
+            if (!isnull)
+                node->simd_values[node->simd_batch_count] = DatumGetInt32(d);
+            else
+                node->simd_values[node->simd_batch_count] = 0; /* will fail cmp */
+
+            node->simd_batch_count++;
+        }
+
+        /* No more input at all */
+        if (node->simd_batch_count == 0)
+        {
+            return ExecClearTuple(resultSlot); /* EOF */
+        }
+
+        /* 3) SIMD filter on the batch of int32 values */
+        node->simd_match_count =
+            simd_filter_int32(node->simd_values,
+                              node->simd_batch_count,
+                              node->filter_threshold,
+                              node->filter_op,
+                              node->simd_match_idx);
+
+        node->simd_match_pos = 0;
+
+        /* If this batch had no matches, loop again and read more tuples */
+        if (node->simd_match_count == 0)
+            continue;
+
+        /* Otherwise, the next loop iteration will return the first match */
+    }
+}
+
+
+
+
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
 
@@ -139,6 +424,10 @@ ExecSeqScanWithQual(PlanState *pstate)
 	pg_assume(pstate->qual != NULL);
 	Assert(pstate->ps_ProjInfo == NULL);
 
+	elog(NOTICE, "ExecSeqScanWithQual");
+	if(node->use_simd_filter)
+		return ExecSeqScanSIMD(node);
+
 	return ExecScanExtended(&node->ss,
 							(ExecScanAccessMtd) SeqNext,
 							(ExecScanRecheckMtd) SeqRecheck,
@@ -179,6 +468,8 @@ ExecSeqScanWithQualProject(PlanState *pstate)
 	Assert(pstate->state->es_epq_active == NULL);
 	pg_assume(pstate->qual != NULL);
 	pg_assume(pstate->ps_ProjInfo != NULL);
+	if(node->use_simd_filter)
+		return ExecSeqScanSIMD(node);
 
 	return ExecScanExtended(&node->ss,
 							(ExecScanAccessMtd) SeqNext,
@@ -279,7 +570,59 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 		else
 			scanstate->ss.ps.ExecProcNode = ExecSeqScanWithQualProject;
 	}
+	const char *flag = getenv("PG_FORCE_SIMD_FILTER");
+	if (flag != NULL && strcmp(flag, "1") == 0)  // Disable SIMD for the final combine phase
+	{
+		Plan *plan = scanstate->ss.ps.plan;
 
+		/* Plan quals are a List* of Expr* */
+		List *qualList = plan->qual;
+
+		/* We only handle one simple qual: WHERE col OP const/param */
+		if (list_length(qualList) != 1){
+			elog(LOG, "Doesn't activate SIMD Filter");
+			scanstate->use_simd_filter = false;
+		}
+
+		Expr *expr = linitial(qualList);
+
+		
+		AttrNumber   attno;
+		SimdFilterOp opk;
+		bool         is_param;
+		int          param_id;
+		int32        const_val;
+
+		if (analyze_simd_filter_qual(expr,
+									&attno, &opk, &is_param, &param_id, &const_val))
+		{
+			elog(NOTICE, "activate SIMD Filter");
+			scanstate->use_simd_filter   = true;
+			scanstate->filter_op         = opk;
+			scanstate->filter_attno      = attno;
+			scanstate->filter_from_param = is_param;
+			scanstate->filter_param_id   = param_id;
+			scanstate->filter_threshold  = const_val;
+
+			scanstate->simd_batch_size  = 4096;
+			scanstate->simd_values      = palloc(sizeof(int32) * scanstate->simd_batch_size);
+			scanstate->simd_match_idx   = palloc(sizeof(int)   * scanstate->simd_batch_size);
+			scanstate->simd_batch_count = 0;
+			scanstate->simd_match_count = 0;
+			scanstate->simd_match_pos   = 0;
+			scanstate->simd_threshold_inited = false;
+		}
+		else
+		{
+			elog(NOTICE, "Doesn't activate SIMD Filter");
+			scanstate->use_simd_filter = false;
+		}
+	}
+	else
+	{
+		elog(NOTICE, "Doesn't activate SIMD Filter");
+		scanstate->use_simd_filter = false;
+	}
 	return scanstate;
 }
 

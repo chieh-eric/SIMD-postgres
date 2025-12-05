@@ -245,10 +245,7 @@
  *
  *-------------------------------------------------------------------------
  */
-
-#include <immintrin.h>
 #include "postgres.h"
-
 #include "access/htup_details.h"
 #include "access/parallel.h"
 #include "catalog/objectaccess.h"
@@ -278,8 +275,23 @@
 #include "utils/tuplesort.h"
 #include "fmgr.h"
 #include <stdlib.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
+#include "utils/array.h"
 
-bool enable_simd_agg = false;
+
+#define INT8SUM_OID 2107
+#define INT4SUM_OID 2108
+#define INT4MAX_OID 2116
+#define INT4MIN_OID 2132
+#define COUNT_ANY_OID 2147
+#define INT4AVG_OID 2100
+#define INT8AVG_OID 2101
+
 
 /*
  * Control how many partitions are created when spilling HashAgg to
@@ -423,6 +435,8 @@ static void initialize_hash_entry(AggState *aggstate,
 								  TupleHashEntry entry);
 static void lookup_hash_entries(AggState *aggstate);
 static TupleTableSlot *agg_retrieve_direct(AggState *aggstate);
+/* direct retrieve simd */
+static TupleTableSlot *agg_retrieve_plain_simd(AggState *aggstate); 
 static void agg_fill_hash_table(AggState *aggstate);
 static bool agg_refill_hash_table(AggState *aggstate);
 static TupleTableSlot *agg_retrieve_hash_table(AggState *aggstate);
@@ -564,8 +578,10 @@ fetch_input_tuple(AggState *aggstate)
 			return NULL;
 		slot = aggstate->sort_slot;
 	}
-	else
+	else{
 		slot = ExecProcNode(outerPlanState(aggstate));
+	}
+		
 
 	if (!TupIsNull(slot) && aggstate->sort_out)
 		tuplesort_puttupleslot(aggstate->sort_out, slot);
@@ -810,14 +826,12 @@ advance_transition_function(AggState *aggstate,
 
 
 
-#define INT8SUM_OID 2107
-#define INT4SUM_OID 2108
+typedef struct Int8TransTypeData
+{
+    int64   count;
+    int64   sum;
+} Int8TransTypeData;
 
-#define INT4MAX_OID 2116
-
-#define INT4MIN_OID 2132
-
-#define INT4CNT_OID 2147
 
 static void
 advance_aggregates_simd(AggState *aggstate)
@@ -842,12 +856,91 @@ advance_aggregates_simd(AggState *aggstate)
     peragg = &aggstate->peragg[0];
 	pertrans = &aggstate->pertrans[peragg->transno];
 	fnoid = peragg->aggref->aggfnoid; 
+#ifdef __aarch64__
+	{
 
-	// elog(NOTICE, "fnoid: %d", fnoid);
+		i = 0;
+		AggStatePerAgg   peragg = &aggstate->peragg[0];
+		AggStatePerGroup pergroup;
+		Aggref          *aggref = peragg->aggref;
+		TargetEntry     *tle;
+		Var             *v;
+		int64x2_t        vsum64;
+		int64            lanes[2];
+		if (fnoid == INT4SUM_OID || fnoid == INT8AVG_OID)
+		{
+			tle = (TargetEntry *) linitial(aggref->args);
+			v   = (Var *) tle->expr;
+			vsum64 = vdupq_n_s64(0);
+			for (; i + 4 <= n; i += 4)
+			{
+				int32x4_t v32 = vld1q_s32(&buf[i]);
+				int64x2_t v64 = vpaddlq_s32(v32);
+				vsum64 = vaddq_s64(vsum64, v64);
+			}
+			vst1q_s64(lanes, vsum64);
+			total = lanes[0] + lanes[1];
+			for (; i < n; i++)
+				total += buf[i];
+		}
+		else if(fnoid == INT4MIN_OID || fnoid == INT4MAX_OID){
+			if (n >= 4)
+			{
+				int32x4_t vmin = vld1q_s32(&buf[0]);
+				int32x4_t vmax = vmin;
 
-#ifdef __AVX2__
+				int idx = 4;
+
+				for (; idx + 4 <= n; idx += 4)
+				{
+					int32x4_t v = vld1q_s32(&buf[idx]);
+					vmin = vminq_s32(vmin, v);
+					vmax = vmaxq_s32(vmax, v);
+				}
+
+				/* horizontal reduction */
+				int32_t tmpmin[4], tmpmax[4];
+				vst1q_s32(tmpmin, vmin);
+				vst1q_s32(tmpmax, vmax);
+
+				cur_min = tmpmin[0];
+				cur_max = tmpmax[0];
+
+				for (int j = 1; j < 4; j++)
+				{
+					if (tmpmin[j] < cur_min)
+						cur_min = tmpmin[j];
+					if (tmpmax[j] > cur_max)
+						cur_max = tmpmax[j];
+				}
+
+				/* tail elements */
+				for (; idx < n; idx++)
+				{
+					if (buf[idx] < cur_min)
+						cur_min = buf[idx];
+					if (buf[idx] > cur_max)
+						cur_max = buf[idx];
+				}
+			}
+			else
+			{
+				/* small batch: scalar min/max */
+				cur_min = cur_max = buf[0];
+				for (i = 1; i < n; i++)
+				{
+					if (buf[i] < cur_min)
+						cur_min = buf[i];
+					if (buf[i] > cur_max)
+						cur_max = buf[i];
+				}
+			}
+		}
+	}
+
+#elif defined(__AVX2__)
     {
-		if(fnoid == INT4SUM_OID){
+		if(fnoid == INT4SUM_OID || fnoid == INT8AVG_OID){
 			__m256i acc;
 
 			acc = _mm256_setzero_si256();
@@ -955,7 +1048,7 @@ advance_aggregates_simd(AggState *aggstate)
 	}
 #else
     {
-		if(fnoid == INT4SUM_OID){
+		if(fnoid == INT4SUM_OID || fnoid == INT8AVG_OID){
 			for (i = 0; i < n; i++)
 			{
 				total += buf[i];
@@ -985,13 +1078,11 @@ advance_aggregates_simd(AggState *aggstate)
 		}
 		else
 		{
-			int64 oldv;
-
-			oldv = DatumGetInt64(pergroup->transValue);
+			int64 oldv = DatumGetInt64(pergroup->transValue);
 			pergroup->transValue = Int64GetDatum(oldv + total);
 		}
 	}
-	else if (fnoid == INT4CNT_OID)
+	else if (fnoid == COUNT_ANY_OID)
     {
         if (pergroup->transValueIsNull || pergroup->noTransValue)
         {
@@ -1033,6 +1124,18 @@ advance_aggregates_simd(AggState *aggstate)
                 pergroup->transValue = Int32GetDatum(cur_min);
         }
     }
+	else if (fnoid == INT8AVG_OID)
+	{
+		pergroup = &aggstate->pergroups[aggstate->current_set][peragg->transno];
+		ArrayType         *transarray;
+		Int8TransTypeData *transdata;
+
+		transarray = DatumGetArrayTypeP(pergroup->transValue);
+		transdata = (Int8TransTypeData *) ARR_DATA_PTR(transarray);
+		transdata->sum   += total;
+		transdata->count += n;
+		aggstate->simd_batch_count = 0;
+	}
     aggstate->simd_batch_count = 0;
 }
 
@@ -2886,6 +2989,26 @@ agg_retrieve_direct(AggState *aggstate)
 	return NULL;
 }
 
+
+static TupleTableSlot *
+agg_retrieve_plain_simd(AggState *aggstate)
+{
+	Agg		   *node = aggstate->phase->aggnode;
+	ExprContext *econtext;
+	ExprContext *tmpcontext;
+	AggStatePerAgg peragg;
+	AggStatePerGroup *pergroups;
+	TupleTableSlot *outerslot;
+	TupleTableSlot *firstSlot;
+	TupleTableSlot *result;
+	bool		hasGroupingSets = aggstate->phase->numsets > 0;
+	int			numGroupingSets = Max(aggstate->phase->numsets, 1);
+	int			currentSet;
+	int			nextSetSize;
+	int			numReset;
+	int			i;
+}
+
 /*
  * ExecAgg for hashed case: read input and build hash table
  */
@@ -3531,6 +3654,51 @@ hashagg_reset_spill_state(AggState *aggstate)
 		aggstate->hash_tapeset = NULL;
 	}
 }
+static bool agg_supports_simd(AggState *aggstate)
+{
+    AggStatePerAgg peragg;
+    Aggref *aggref;
+
+    /* Disable SIMD in the final combine phase */
+    if (aggstate->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+    {
+        elog(NOTICE, "[SIMD] Disabled: parallel final combine stage");
+        return false;
+    }
+
+    peragg = &aggstate->peragg[0];
+    aggref = peragg->aggref;
+    Oid fno = aggref->aggfnoid;
+
+    /* Disable SIMD for COUNT */
+    if (fno == COUNT_ANY_OID)
+    {
+        elog(NOTICE, "[SIMD] Enabled: COUNT");
+        return true;
+    }
+
+    /* SUM(int4/int8) supported */
+    if (fno == INT4SUM_OID || fno == INT8SUM_OID)
+    {
+        elog(NOTICE, "[SIMD] Enabled: SUM (%u)", fno);
+        return true;
+    }
+
+    /* AVG(int8) */
+    if (fno == INT8AVG_OID)
+    {
+        elog(NOTICE, "[SIMD] Enabled: AVG (%u) using SIMD-SUM + scalar COUNT", fno);
+        return true;
+    }
+	if (fno == INT4MIN_OID || fno == INT4MAX_OID)
+	{
+		elog(NOTICE, "[SIMD] Enabled: MIN/MAX (%u)", fno);
+        return true;
+	}
+    elog(NOTICE, "[SIMD] Disabled: Unsupported aggregate fnoid=%u", fno);
+    return false;
+}
+
 
 
 /* -----------------
@@ -3598,23 +3766,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 	aggstate->sort_in = NULL;
 	aggstate->sort_out = NULL;
 
-	/* Decide if we should enable SIMD */
-	/* Environment flag override */
-	const char *flag = getenv("PG_FORCE_SIMD_AGG");
-	if (flag != NULL &&
-		strcmp(flag, "1") == 0 &&
-		node->aggsplit == AGGSPLIT_INITIAL_SERIAL)  // Disable SIMD for the final combine phase
-	{
-		aggstate->use_simd_agg = true;
-		aggstate->simd_batch_size  = 4096;
-		aggstate->simd_batch_count = 0;
-		aggstate->simd_batch_buf   = palloc(sizeof(int32) * aggstate->simd_batch_size);
-	}
-	else
-	{
-		aggstate->use_simd_agg = false;
-	}
-	elog(NOTICE, "aggstate->use_simd_agg: %d", aggstate->use_simd_agg);
+	
 
 	/*
 	 * phases[0] always exists, but is dummy in sorted/plain mode
@@ -4401,6 +4553,21 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 		phase->evaltrans_cache[0][0] = phase->evaltrans;
 	}
 
+	/* Decide if we should enable SIMD */
+	/* Environment flag override */
+	const char *flag = getenv("PG_FORCE_SIMD_AGG");
+	if (flag != NULL && strcmp(flag, "1") == 0 && agg_supports_simd(aggstate))  // Disable SIMD for the final combine phase
+	{
+		aggstate->use_simd_agg = true;
+		aggstate->simd_batch_size  = 4096;
+		aggstate->simd_batch_count = 0;
+		aggstate->simd_batch_buf   = palloc(sizeof(int32) * aggstate->simd_batch_size);
+	}
+	else
+	{
+		elog(LOG, "Doesn't activate SIMD");
+		aggstate->use_simd_agg = false;
+	}
 	return aggstate;
 }
 
