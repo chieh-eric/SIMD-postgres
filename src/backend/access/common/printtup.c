@@ -265,13 +265,15 @@ printtup_prepare_info(DR_printtup *myState, TupleDesc typeinfo, int numAttrs)
 
 	myState->myinfo = (PrinttupAttrInfo *)
 		palloc0(numAttrs * sizeof(PrinttupAttrInfo));
-
+	elog(NOTICE, "printtup_prepare_info: numAttrs=%d formats=%p",
+     numAttrs, formats);
 	for (i = 0; i < numAttrs; i++)
 	{
 		PrinttupAttrInfo *thisState = myState->myinfo + i;
 		int16		format = (formats ? formats[i] : 0);
 		Form_pg_attribute attr = TupleDescAttr(typeinfo, i);
 
+		elog(NOTICE, "  attr %d: format=%d", i, (int)format);
 		thisState->format = format;
 		if (format == 0)
 		{
@@ -290,7 +292,7 @@ printtup_prepare_info(DR_printtup *myState, TupleDesc typeinfo, int numAttrs)
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("unsupported format code: %d", format)));
+					 errmsg("unsupported format code 1: %d", format)));
 	}
 }
 

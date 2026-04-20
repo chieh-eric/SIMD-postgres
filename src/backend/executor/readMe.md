@@ -1,1 +1,0 @@
-PG_FORCE_SIMD_AGG=1 $HOME/pgsimd/bin/postgres -D $HOME/pgsimd/data

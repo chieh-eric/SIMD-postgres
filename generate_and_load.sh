@@ -21,8 +21,8 @@ for ((i=1;i<=CHUNKS;i++)); do
             SELECT
                 md5(random()::text),
                 (date '2000-01-01' + (random()*7000)::int),
-                1::int,
-                (random()*1000)::int,
+                (($i - 1) * $ROWS_PER_CHUNK + g)::int,
+                (random()*10)::int,
                 (random()*1000)::int,
                 lpad((floor(random()*10000000000))::bigint::text, 10, '0'),
                 'Product ' || g,

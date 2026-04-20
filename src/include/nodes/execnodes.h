@@ -1628,10 +1628,37 @@ typedef struct ScanState
  *	 SeqScanState information
  * ----------------
  */
+
+typedef enum SimdFilterOp
+{
+    SIMD_FILTER_NONE = 0,
+    SIMD_FILTER_GT,
+    SIMD_FILTER_EQ,
+    SIMD_FILTER_LT
+} SimdFilterOp;
+
 typedef struct SeqScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
 	Size		pscan_len;		/* size of parallel heap scan descriptor */
+
+	/* SIMD filter experiment */
+    bool        use_simd_filter;
+
+    int         simd_batch_size;
+	int         simd_batch_count;
+	int         simd_match_count;
+	int         simd_match_pos;
+
+	int         filter_attno;        /* 1-based, l_orderkey column */
+	int32      *simd_values;         /* [simd_batch_size] */
+	int        *simd_match_idx;      /* [simd_batch_size] */
+
+	bool        filter_from_param;
+	bool        simd_threshold_inited;
+	int32       filter_threshold;
+	int 		filter_param_id;
+	SimdFilterOp filter_op;
 } SeqScanState;
 
 /* ----------------
